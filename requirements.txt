@@ -1,4 +1,2 @@
 pyTelegramBotAPI==4.14.0
 yt-dlp==2023.11.16
-pydub==0.25.1
-
