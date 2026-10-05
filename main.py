@@ -33,7 +33,7 @@ def download_audio(message):
 
     bot.reply_to(message, "Audio download ho raha hai, thoda intezaar karein...")
 
-        ydl_opts = {
+    ydl_opts = {
         'format': 'bestaudio/best',
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -45,7 +45,6 @@ def download_audio(message):
         }],
         'outtmpl': 'downloaded_audio.%(ext)s',
     }
-
 
     audio_file = None
     try:
@@ -70,10 +69,10 @@ if __name__ == '__main__':
         bot.remove_webhook()
     except Exception:
         pass
-    
+
     # Flask ko alag thread me chalate hain taaki bot polling me ruk na jaye
     server_thread = threading.Thread(target=run_flask)
     server_thread.start()
-    
+
     # Bot polling start karein
     bot.infinity_polling()
