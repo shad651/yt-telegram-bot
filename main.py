@@ -1,10 +1,25 @@
 import os
+import threading
+from flask import Flask
 import telebot
 import yt_dlp
 
 TOKEN = os.environ.get('BOT_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
+# 1. Render ke liye ek chhota sa dummy web server
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive and running!"
+
+def run_flask():
+    # Render jo PORT deta hai, us par server bind karna zaroori hai
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# 2. Telegram Bot Handlers
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(message, "Hello! Mujhe YouTube video ka link bhejein, main aapko MP3 audio bhej dunga.")
@@ -46,11 +61,15 @@ def download_audio(message):
         bot.reply_to(message, f"Kuch error aa gaya: {str(e)}")
 
 if __name__ == '__main__':
-    print("Bot chalu ho raha hai...")
+    print("Bot aur Web Server chalu ho rahe hain...")
     try:
-        # Purane webhooks aur 409 conflict errors ko hatane ke liye
         bot.remove_webhook()
     except Exception:
         pass
     
+    # Flask ko alag thread me chalate hain taaki bot polling me ruk na jaye
+    server_thread = threading.Thread(target=run_flask)
+    server_thread.start()
+    
+    # Bot polling start karein
     bot.infinity_polling()
