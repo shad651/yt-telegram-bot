@@ -17,8 +17,7 @@ def download_audio(message):
         return
 
     bot.reply_to(message, "Audio download ho raha hai, thoda intezaar karein...")
-    
-    # Yahan preferredquality ko 128k ya 96k rakhne se bade videos ka size bhi 10MB ke andar hi ban jata hai
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -39,13 +38,19 @@ def download_audio(message):
         bot.reply_to(message, "Audio bheja ja raha hai...")
         with open(audio_file, 'rb') as audio:
             bot.send_audio(message.chat.id, audio)
-        
+
         if os.path.exists(audio_file):
             os.remove(audio_file)
-            
+
     except Exception as e:
         bot.reply_to(message, f"Kuch error aa gaya: {str(e)}")
 
 if __name__ == '__main__':
     print("Bot chalu ho raha hai...")
+    try:
+        # Purane webhooks aur 409 conflict errors ko hatane ke liye
+        bot.remove_webhook()
+    except Exception:
+        pass
+    
     bot.infinity_polling()
