@@ -33,8 +33,11 @@ def download_audio(message):
 
     bot.reply_to(message, "Audio download ho raha hai, thoda intezaar karein...")
 
-    ydl_opts = {
+        ydl_opts = {
         'format': 'bestaudio/best',
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -42,6 +45,7 @@ def download_audio(message):
         }],
         'outtmpl': 'downloaded_audio.%(ext)s',
     }
+
 
     audio_file = None
     try:
