@@ -691,13 +691,27 @@ Deno.serve(async (req: Request) => {
 
     return jsonResponse({ ok: true });
   } catch (error) {
-    console.error("Processing failed:", error);
+  console.error("Processing failed:", error);
 
-    await supabase
-      .from("telegram_webhook_updates")
-      .delete()
-      .eq("update_id", update.update_id);
+  // Failed update ko processed mark karo,
+  // taaki Telegram use baar-baar retry na kare.
+  const { error: statusError } = await supabase
+    .from("telegram_webhook_updates")
+    .update({ status: "processed" })
+    .eq("update_id", update.update_id);
 
-    return jsonResponse({ error: "Processing failed" }, 500);
+  if (statusError) {
+    console.error(
+      "Failed to mark update as processed:",
+      statusError,
+    );
   }
+
+  // Telegram ko successful HTTP response do.
+  // Failed message dobara deliver hone se rukega.
+  return jsonResponse({
+    ok: true,
+    processing_failed: true,
+  });
+}
 });
