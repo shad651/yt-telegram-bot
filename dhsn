@@ -210,6 +210,75 @@ async function getPublishedDramas(): Promise<Response> {
 }
 
 /**
+ * GET ?type=episodes&drama_id=UUID
+ * Published drama ke episodes return karta hai.
+ */
+async function getDramaEpisodes(
+  dramaId: string | null,
+): Promise<Response> {
+  if (!dramaId) {
+    return jsonResponse({
+      success: false,
+      error: "Missing drama_id",
+    }, 400);
+  }
+
+  const uuidPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  if (!uuidPattern.test(dramaId)) {
+    return jsonResponse({
+      success: false,
+      error: "Invalid drama_id",
+    }, 400);
+  }
+
+  const { data: drama, error: dramaError } = await supabase
+    .from("dramas")
+    .select("id")
+    .eq("id", dramaId)
+    .eq("is_published", true)
+    .maybeSingle();
+
+  if (dramaError) {
+    console.error("Drama lookup failed:", dramaError);
+
+    return jsonResponse({
+      success: false,
+      error: "Could not fetch drama",
+    }, 500);
+  }
+
+  if (!drama) {
+    return jsonResponse({
+      success: false,
+      error: "Drama not found or not published",
+    }, 404);
+  }
+
+  const { data: episodes, error: episodesError } = await supabase
+    .from("episodes")
+    .select("id, drama_id, season_number, episode_number, video_url")
+    .eq("drama_id", dramaId)
+    .order("season_number", { ascending: true })
+    .order("episode_number", { ascending: true });
+
+  if (episodesError) {
+    console.error("Episodes query failed:", episodesError);
+
+    return jsonResponse({
+      success: false,
+      error: "Could not fetch episodes",
+    }, 500);
+  }
+
+  return jsonResponse({
+    success: true,
+    episodes: episodes ?? [],
+  });
+}
+
+/**
  * GET ?media=drama&id=UUID
  * Telegram se drama thumbnail return karta hai.
  */
@@ -637,6 +706,10 @@ Deno.serve(async (req: Request) => {
       return await getPublishedDramas();
     }
 
+    if (type === "episodes") {
+      return await getDramaEpisodes(url.searchParams.get("drama_id"));
+    }
+
     return jsonResponse({
       success: false,
       error: "Invalid endpoint",
@@ -690,7 +763,22 @@ Deno.serve(async (req: Request) => {
       .eq("update_id", update.update_id);
 
     return jsonResponse({ ok: true });
-  } catch (error) {
+ 
+
+ } catch (error) {
+    console.error("Processing failed:", error);
+
+    await supabase
+      .from("telegram_webhook_updates")
+      .delete()
+      .eq("update_id", update.update_id);
+
+    return jsonResponse({ error: "Processing failed" }, 500);
+  }
+});
+
+
+} catch (error) {
   console.error("Processing failed:", error);
 
   // Failed update ko processed mark karo,
@@ -714,4 +802,3 @@ Deno.serve(async (req: Request) => {
     processing_failed: true,
   });
 }
-});
