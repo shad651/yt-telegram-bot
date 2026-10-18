@@ -1,0 +1,703 @@
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const SUPABASE_URL = Deno.env.get("MyDrama_URL")!;
+const SERVICE_ROLE_KEY = Deno.env.get("SERVICE_ROLE_KEY")!;
+const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
+const WEBHOOK_SECRET = Deno.env.get("TELEGRAM_WEBHOOK_SECRET")!;
+
+const supabase = createClient(
+  SUPABASE_URL,
+  SERVICE_ROLE_KEY,
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  },
+);
+
+function jsonResponse(
+  data: unknown,
+  status = 200,
+): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers":
+        "Content-Type, X-Telegram-Bot-Api-Secret-Token, Authorization, apikey",
+    },
+  });
+}
+
+interface TelegramPhoto {
+  file_id: string;
+  file_unique_id?: string;
+  width?: number;
+  height?: number;
+}
+
+interface TelegramMessage {
+  message_id: number;
+  chat?: {
+    id: number;
+  };
+  text?: string;
+  caption?: string;
+  photo?: TelegramPhoto[];
+}
+
+interface TelegramUpdate {
+  update_id: number;
+  channel_post?: TelegramMessage;
+  message?: TelegramMessage;
+}
+
+function parseFields(text: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+
+  for (const line of text.split(/\r?\n/)) {
+    const separator = line.indexOf(":");
+
+    if (separator === -1) {
+      continue;
+    }
+
+    const key = line.slice(0, separator).trim().toLowerCase();
+    const value = line.slice(separator + 1).trim();
+
+    if (key) {
+      fields[key] = value;
+    }
+  }
+
+  return fields;
+}
+
+function positiveInteger(
+  value: string | undefined,
+): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const number = Number(value);
+
+  if (!Number.isSafeInteger(number) || number < 1) {
+    return null;
+  }
+
+  return number;
+}
+
+function validateVideoUrl(
+  value: string | undefined,
+): string | null {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    const url = new URL(value);
+
+    if (
+      url.protocol !== "https:" ||
+      !url.hostname ||
+      url.username ||
+      url.password
+    ) {
+      return null;
+    }
+
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function telegramRequest(
+  method: string,
+  body: Record<string, unknown>,
+): Promise<any> {
+  const response = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok || !result.ok) {
+    console.error(
+      `Telegram ${method} failed:`,
+      JSON.stringify(result),
+    );
+
+    throw new Error(`Telegram ${method} failed`);
+  }
+
+  return result;
+}
+
+async function sendReply(
+  message: TelegramMessage,
+  text: string,
+): Promise<void> {
+  if (!message.chat?.id) {
+    return;
+  }
+
+  try {
+    await telegramRequest("sendMessage", {
+      chat_id: message.chat.id,
+      text,
+    });
+  } catch (error) {
+    console.error("Reply error:", error);
+  }
+}
+
+/**
+ * GET ?type=dramas
+ * Published dramas ki list.
+ */
+async function getPublishedDramas(): Promise<Response> {
+  const { data, error } = await supabase
+    .from("dramas")
+    .select(
+      [
+        "id",
+        "title",
+        "categories",
+        "release_year",
+        "language",
+        "description",
+        "type",
+        "created_at",
+        "is_published",
+      ].join(","),
+    )
+    .eq("is_published", true)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("Drama list query failed:", error);
+
+    return jsonResponse({
+      success: false,
+      error: "Could not fetch dramas",
+    }, 500);
+  }
+
+  const dramas = (data ?? []).map((drama) => ({
+    ...drama,
+    poster_url:
+      `${SUPABASE_URL}/functions/v1/telegram-content-webhook` +
+      `?media=drama&id=${encodeURIComponent(drama.id)}`,
+  }));
+
+  return jsonResponse({
+    success: true,
+    dramas,
+  });
+}
+
+/**
+ * GET ?media=drama&id=UUID
+ * Telegram se drama thumbnail return karta hai.
+ */
+async function getDramaThumbnail(
+  dramaId: string | null,
+): Promise<Response> {
+  if (!dramaId) {
+    return jsonResponse({
+      success: false,
+      error: "Missing drama ID",
+    }, 400);
+  }
+
+  const uuidPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  if (!uuidPattern.test(dramaId)) {
+    return jsonResponse({
+      success: false,
+      error: "Invalid drama ID",
+    }, 400);
+  }
+
+  const { data: drama, error } = await supabase
+    .from("dramas")
+    .select("id, thumbnail_file_id, is_published")
+    .eq("id", dramaId)
+    .eq("is_published", true)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Thumbnail database query failed:", error);
+
+    return jsonResponse({
+      success: false,
+      error: "Could not fetch drama thumbnail metadata",
+    }, 500);
+  }
+
+  if (!drama) {
+    return jsonResponse({
+      success: false,
+      error: "Published drama not found",
+    }, 404);
+  }
+
+  const fileId = drama.thumbnail_file_id;
+
+  if (!fileId || typeof fileId !== "string") {
+    return jsonResponse({
+      success: false,
+      error: "Drama thumbnail_file_id is missing",
+    }, 404);
+  }
+
+  if (!BOT_TOKEN) {
+    console.error("TELEGRAM_BOT_TOKEN is not configured");
+
+    return jsonResponse({
+      success: false,
+      error: "Telegram content bot is not configured",
+    }, 500);
+  }
+
+  let fileData: any;
+
+  try {
+    const fileResponse = await fetch(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getFile` +
+        `?file_id=${encodeURIComponent(fileId)}`,
+    );
+
+    fileData = await fileResponse.json();
+
+    if (
+      !fileResponse.ok ||
+      !fileData.ok ||
+      !fileData.result?.file_path
+    ) {
+      console.error(
+        "Telegram getFile failed:",
+        JSON.stringify(fileData),
+      );
+
+      return jsonResponse({
+        success: false,
+        error: "Telegram getFile failed",
+      }, 502);
+    }
+  } catch (error) {
+    console.error("Telegram getFile request error:", error);
+
+    return jsonResponse({
+      success: false,
+      error: "Could not contact Telegram getFile API",
+    }, 502);
+  }
+
+  const filePath = fileData.result.file_path as string;
+
+  let imageResponse: Response;
+
+  try {
+    imageResponse = await fetch(
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
+    );
+  } catch (error) {
+    console.error("Telegram file download error:", error);
+
+    return jsonResponse({
+      success: false,
+      error: "Could not download Telegram file",
+    }, 502);
+  }
+
+  const contentType =
+    imageResponse.headers.get("content-type") ?? "unknown";
+
+  if (!imageResponse.ok) {
+    return jsonResponse({
+      success: false,
+      error: "Telegram file download failed",
+      telegram_http_status: imageResponse.status,
+      content_type: contentType,
+    }, 502);
+  }
+
+  const imageBytes = await imageResponse.arrayBuffer();
+
+  if (imageBytes.byteLength === 0) {
+    return jsonResponse({
+      success: false,
+      error: "Telegram returned an empty file",
+    }, 502);
+  }
+
+  const bytes = new Uint8Array(imageBytes);
+
+  const isJpeg =
+    bytes.length >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff;
+
+  const isPng =
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a;
+
+  const isGif =
+    bytes.length >= 6 &&
+    /^GIF8[79]a$/.test(
+      String.fromCharCode(...bytes.slice(0, 6)),
+    );
+
+  const isWebp =
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" &&
+    String.fromCharCode(...bytes.slice(8, 12)) === "WEBP";
+
+  let detectedType: string | null = null;
+
+  if (isJpeg) {
+    detectedType = "image/jpeg";
+  } else if (isPng) {
+    detectedType = "image/png";
+  } else if (isGif) {
+    detectedType = "image/gif";
+  } else if (isWebp) {
+    detectedType = "image/webp";
+  }
+
+  if (!detectedType) {
+    const preview = new TextDecoder()
+      .decode(bytes.slice(0, 300))
+      .replace(/[\r\n\t]+/g, " ");
+
+    console.error(
+      "Telegram file is not a recognized image:",
+      JSON.stringify({
+        contentType,
+        fileSize: bytes.byteLength,
+        preview,
+      }),
+    );
+
+    return jsonResponse({
+      success: false,
+      error: "Telegram file is not a recognized image",
+      content_type: contentType,
+      file_size: bytes.byteLength,
+      response_preview: preview,
+    }, 502);
+  }
+
+  return new Response(imageBytes, {
+    status: 200,
+    headers: {
+      "Content-Type": detectedType,
+      "Content-Length": String(bytes.byteLength),
+      "Cache-Control": "public, max-age=3600",
+      "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+/**
+ * Telegram channel update process karta hai.
+ */
+async function processUpdate(
+  update: TelegramUpdate,
+): Promise<void> {
+  const message = update.channel_post ?? update.message;
+
+  if (!message) {
+    return;
+  }
+
+  const caption = message.caption ?? message.text ?? "";
+  const fields = parseFields(caption);
+  const action = (fields["action"] ?? "").toUpperCase();
+
+  if (
+    action !== "NEW_DRAMA" &&
+    action !== "ADD_EPISODE"
+  ) {
+    console.log(
+      "Update ignored: no recognized ACTION",
+      update.update_id,
+    );
+    return;
+  }
+
+  if (action === "NEW_DRAMA") {
+    const title = fields["title"];
+    const episodeNumber = positiveInteger(fields["episode"]);
+    const videoUrl = validateVideoUrl(fields["url"]);
+
+    const categoryText = fields["category"] ?? "";
+    const categories = categoryText
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    const year = fields["year"]
+      ? Number(fields["year"])
+      : null;
+
+    const language = fields["language"] ?? null;
+    const description = fields["description"] ?? null;
+
+    if (!title || !episodeNumber || !videoUrl) {
+      await sendReply(
+        message,
+        "Error: NEW_DRAMA ke liye Title, Episode aur valid HTTPS URL zaroori hain.",
+      );
+      throw new Error("Invalid NEW_DRAMA fields");
+    }
+
+    if (
+      year !== null &&
+      (!Number.isInteger(year) || year < 1900 || year > 2200)
+    ) {
+      await sendReply(
+        message,
+        "Error: Year valid nahi hai.",
+      );
+      throw new Error("Invalid year");
+    }
+
+    const photos = message.photo ?? [];
+    const thumbnail = photos.length
+      ? photos[photos.length - 1].file_id
+      : null;
+
+    const { data: drama, error: dramaError } = await supabase
+      .from("dramas")
+      .insert({
+        title,
+        categories,
+        release_year: year,
+        language,
+        description,
+        type: "Drama",
+        is_published: true,
+        thumbnail_file_id: thumbnail,
+      })
+      .select("id")
+      .single();
+
+    if (dramaError || !drama) {
+      console.error("Drama insert failed:", dramaError);
+
+      await sendReply(
+        message,
+        "Error: Drama save nahi ho saka. Supabase logs check karo.",
+      );
+
+      throw new Error("Drama insert failed");
+    }
+
+    const { error: episodeError } = await supabase
+      .from("episodes")
+      .insert({
+        drama_id: drama.id,
+        season_number: 1,
+        episode_number: episodeNumber,
+        video_url: videoUrl,
+      });
+
+    if (episodeError) {
+      console.error(
+        "First episode insert failed:",
+        episodeError,
+      );
+
+      await sendReply(
+        message,
+        `Drama create ho gaya, lekin episode save nahi hua. Drama ID: ${drama.id}`,
+      );
+
+      throw new Error("First episode insert failed");
+    }
+
+    await sendReply(
+      message,
+      `✅ Success! Drama '${title}' create ho gaya.\nDrama ID: ${drama.id}`,
+    );
+
+    return;
+  }
+
+  if (action === "ADD_EPISODE") {
+    const dramaId = fields["drama id"];
+    const seasonNumber = positiveInteger(fields["season"]) ?? 1;
+    const episodeNumber = positiveInteger(fields["episode"]);
+    const videoUrl = validateVideoUrl(fields["url"]);
+
+    if (!dramaId || !episodeNumber || !videoUrl) {
+      await sendReply(
+        message,
+        "Error: ADD_EPISODE ke liye Drama ID, Episode aur valid HTTPS URL zaroori hain.",
+      );
+      throw new Error("Invalid ADD_EPISODE fields");
+    }
+
+    const { data: drama, error: dramaError } = await supabase
+      .from("dramas")
+      .select("id, title")
+      .eq("id", dramaId)
+      .maybeSingle();
+
+    if (dramaError || !drama) {
+      await sendReply(
+        message,
+        "Error: Di gayi Drama ID ka koi drama nahi mila.",
+      );
+      throw new Error("Drama not found");
+    }
+
+    const { error: episodeError } = await supabase
+      .from("episodes")
+      .insert({
+        drama_id: drama.id,
+        season_number: seasonNumber,
+        episode_number: episodeNumber,
+        video_url: videoUrl,
+      });
+
+    if (episodeError) {
+      if (episodeError.code === "23505") {
+        await sendReply(
+          message,
+          `⚠️ Season ${seasonNumber}, Episode ${episodeNumber} pehle se maujood hai.`,
+        );
+        return;
+      }
+
+      console.error("Episode insert failed:", episodeError);
+      await sendReply(
+        message,
+        "Error: Episode save nahi ho saka.",
+      );
+      throw new Error("Episode insert failed");
+    }
+
+    await sendReply(
+      message,
+      `✅ Success! '${drama.title}' mein Season ${seasonNumber}, Episode ${episodeNumber} add ho gaya.`,
+    );
+  }
+}
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers":
+          "Content-Type, X-Telegram-Bot-Api-Secret-Token, Authorization, apikey",
+      },
+    });
+  }
+
+  const url = new URL(req.url);
+
+  if (req.method === "GET") {
+    const media = url.searchParams.get("media");
+    const type = url.searchParams.get("type");
+
+    if (media === "drama") {
+      return await getDramaThumbnail(url.searchParams.get("id"));
+    }
+
+    if (type === "dramas") {
+      return await getPublishedDramas();
+    }
+
+    return jsonResponse({
+      success: false,
+      error: "Invalid endpoint",
+    }, 400);
+  }
+
+  if (req.method !== "POST") {
+    return jsonResponse({ error: "Method Not Allowed" }, 405);
+  }
+
+  const secretToken = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
+
+  if (!WEBHOOK_SECRET || secretToken !== WEBHOOK_SECRET) {
+    return jsonResponse({ error: "Unauthorized" }, 401);
+  }
+
+  let update: TelegramUpdate;
+
+  try {
+    update = await req.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON" }, 400);
+  }
+
+  if (!Number.isSafeInteger(update.update_id)) {
+    return jsonResponse({ error: "Invalid update_id" }, 400);
+  }
+
+  const { error: reserveError } = await supabase
+    .from("telegram_webhook_updates")
+    .insert({
+      update_id: update.update_id,
+      status: "processing",
+    });
+
+  if (reserveError?.code === "23505") {
+    return jsonResponse({ ok: true, duplicate: true });
+  }
+
+  if (reserveError) {
+    console.error("Failed to reserve update:", reserveError);
+    return jsonResponse({ error: "Database error" }, 500);
+  }
+
+  try {
+    await processUpdate(update);
+
+    await supabase
+      .from("telegram_webhook_updates")
+      .update({ status: "processed" })
+      .eq("update_id", update.update_id);
+
+    return jsonResponse({ ok: true });
+  } catch (error) {
+    console.error("Processing failed:", error);
+
+    await supabase
+      .from("telegram_webhook_updates")
+      .delete()
+      .eq("update_id", update.update_id);
+
+    return jsonResponse({ error: "Processing failed" }, 500);
+  }
+});
