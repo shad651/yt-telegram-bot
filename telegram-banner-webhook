@@ -1,0 +1,429 @@
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-telegram-bot-api-secret-token",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+};
+
+function jsonResponse(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+function getEnv(name: string): string | null {
+  const value = Deno.env.get(name);
+  return value?.trim() || null;
+}
+
+function getSupabase() {
+  const url = getEnv("MyDrama_URL");
+  const key = getEnv("SERVICE_ROLE_KEY");
+
+  if (!url || !key) {
+    throw new Error("Missing MyDrama_URL or SERVICE_ROLE_KEY");
+  }
+
+  return createClient(url, key, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type BannerMedia = {
+  fileId: string;
+  uniqueFileId: string | null;
+  mediaType: "image" | "video";
+};
+
+function extractMedia(post: any): BannerMedia | null {
+  // Telegram photo: choose the largest available size.
+  if (Array.isArray(post.photo) && post.photo.length > 0) {
+    const photo = post.photo[post.photo.length - 1];
+
+    if (typeof photo.file_id === "string" && photo.file_id) {
+      return {
+        fileId: photo.file_id,
+        uniqueFileId: photo.file_unique_id ?? null,
+        mediaType: "image",
+      };
+    }
+  }
+
+  // Telegram video.
+  if (post.video && typeof post.video.file_id === "string") {
+    return {
+      fileId: post.video.file_id,
+      uniqueFileId: post.video.file_unique_id ?? null,
+      mediaType: "video",
+    };
+  }
+
+  // Images/videos sent as documents.
+  if (post.document && typeof post.document.file_id === "string") {
+    const mime = String(post.document.mime_type ?? "").toLowerCase();
+
+    if (mime.startsWith("video/")) {
+      return {
+        fileId: post.document.file_id,
+        uniqueFileId: post.document.file_unique_id ?? null,
+        mediaType: "video",
+      };
+    }
+
+    if (mime.startsWith("image/")) {
+      return {
+        fileId: post.document.file_id,
+        uniqueFileId: post.document.file_unique_id ?? null,
+        mediaType: "image",
+      };
+    }
+  }
+
+  return null;
+}
+
+function parseCaption(caption: string) {
+  const fields: Record<string, string> = {};
+
+  for (const line of caption.split(/\r?\n/)) {
+    const match = line.match(
+      /^\s*(Banner|Drama ID|Title)\s*:\s*(.*?)\s*$/i,
+    );
+
+    if (match) {
+      fields[match[1].toLowerCase()] = match[2].trim();
+    }
+  }
+
+  return {
+    bannerNumber: Number(fields["banner"]),
+    dramaId: fields["drama id"] ?? "",
+    title: fields["title"] ?? "",
+  };
+}
+
+async function sendTelegramMessage(
+  botToken: string,
+  chatId: string | number,
+  text: string,
+  replyToMessageId?: number,
+) {
+  const payload: Record<string, unknown> = {
+    chat_id: chatId,
+    text,
+  };
+
+  if (replyToMessageId) {
+    payload.reply_to_message_id = replyToMessageId;
+    payload.allow_sending_without_reply = true;
+  }
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${botToken}/sendMessage`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+
+  const result = await response.json().catch(() => null);
+
+  if (!response.ok || !result?.ok) {
+    console.error(
+      "Telegram sendMessage failed:",
+      response.status,
+      JSON.stringify(result),
+    );
+    return false;
+  }
+
+  return true;
+}
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: corsHeaders,
+    });
+  }
+
+  if (req.method !== "POST") {
+    return jsonResponse({
+      success: false,
+      error: "This webhook accepts POST requests only",
+    }, 405);
+  }
+
+  const botToken = getEnv("TELEGRAM_BANNER_BOT_TOKEN");
+  const expectedChannel = getEnv("TELEGRAM_BANNER_CHANNEL_ID");
+  const webhookSecret = getEnv("TELEGRAM_BANNER_WEBHOOK_SECRET");
+
+  if (!botToken || !expectedChannel) {
+    console.error("Missing Telegram bot token or channel ID");
+    return jsonResponse({
+      success: false,
+      error: "Server configuration missing",
+    }, 500);
+  }
+
+  if (
+    webhookSecret &&
+    req.headers.get("X-Telegram-Bot-Api-Secret-Token") !== webhookSecret
+  ) {
+    console.error("Rejected webhook request: invalid secret");
+    return jsonResponse({
+      success: false,
+      error: "Unauthorized",
+    }, 401);
+  }
+
+  let update: any;
+
+  try {
+    update = await req.json();
+  } catch (error) {
+    console.error("Invalid webhook JSON:", error);
+    // Acknowledge malformed update so Telegram does not retry it.
+    return jsonResponse({
+      success: false,
+      ignored: true,
+      error: "Invalid JSON",
+    });
+  }
+
+  const post = update?.channel_post;
+
+  if (!post) {
+    // Ignore updates that are not channel posts.
+    return jsonResponse({
+      success: true,
+      ignored: true,
+      reason: "Not a channel post",
+    });
+  }
+
+  const actualChannel = String(post.chat?.id ?? "");
+
+  if (actualChannel !== String(expectedChannel)) {
+    console.error("Ignored post from unexpected channel:", actualChannel);
+
+    // Do not retry an update from another channel.
+    return jsonResponse({
+      success: false,
+      ignored: true,
+      error: "Wrong channel",
+    });
+  }
+
+  const parsed = parseCaption(String(post.caption ?? ""));
+  const { bannerNumber, dramaId, title } = parsed;
+
+  if (
+    !Number.isInteger(bannerNumber) ||
+    bannerNumber < 1 ||
+    bannerNumber > 5
+  ) {
+    console.error("Invalid banner number", {
+      messageId: post.message_id,
+      caption: post.caption ?? null,
+    });
+
+    await sendTelegramMessage(
+      botToken,
+      post.chat.id,
+      "❌ Banner save nahi hua: caption mein Banner: 1 se 5 tak number likho.",
+      post.message_id,
+    );
+
+    return jsonResponse({
+      success: false,
+      ignored: true,
+      error: "Invalid banner number",
+    });
+  }
+
+  if (!title || title.length > 200) {
+    console.error("Invalid title", {
+      messageId: post.message_id,
+      bannerNumber,
+    });
+
+    await sendTelegramMessage(
+      botToken,
+      post.chat.id,
+      "❌ Banner save nahi hua: Title zaroor likho (maximum 200 characters).",
+      post.message_id,
+    );
+
+    return jsonResponse({
+      success: false,
+      ignored: true,
+      error: "Invalid title",
+    });
+  }
+
+  if (!dramaId || !uuidPattern.test(dramaId)) {
+    console.error("Missing or invalid Drama ID", {
+      messageId: post.message_id,
+      bannerNumber,
+    });
+
+    await sendTelegramMessage(
+      botToken,
+      post.chat.id,
+      "❌ Banner save nahi hua: Drama ID mein valid UUID dena zaroori hai.",
+      post.message_id,
+    );
+
+    return jsonResponse({
+      success: false,
+      ignored: true,
+      error: "Invalid Drama ID",
+    });
+  }
+
+  const media = extractMedia(post);
+
+  if (!media) {
+    console.error("No supported image/video found", {
+      messageId: post.message_id,
+      bannerNumber,
+    });
+
+    await sendTelegramMessage(
+      botToken,
+      post.chat.id,
+      "❌ Banner save nahi hua: post mein supported image ya video nahi mili.",
+      post.message_id,
+    );
+
+    return jsonResponse({
+      success: false,
+      ignored: true,
+      error: "No supported media",
+    });
+  }
+
+  try {
+    const supabase = getSupabase();
+
+    // Confirm the drama exists before writing the banner.
+    const { data: drama, error: dramaError } = await supabase
+      .from("dramas")
+      .select("id")
+      .eq("id", dramaId)
+      .maybeSingle();
+
+    if (dramaError) {
+      console.error("Drama lookup failed:", dramaError.message);
+
+      // Acknowledge to prevent Telegram retries, but do not report success.
+      return jsonResponse({
+        success: false,
+        error: "Drama lookup failed",
+      });
+    }
+
+    if (!drama) {
+      console.error("Drama ID not found:", dramaId);
+
+      await sendTelegramMessage(
+        botToken,
+        post.chat.id,
+        `❌ Banner ${bannerNumber} save nahi hua: Drama ID ${dramaId} dramas table mein nahi mili.`,
+        post.message_id,
+      );
+
+      return jsonResponse({
+        success: false,
+        ignored: true,
+        error: "Drama not found",
+      });
+    }
+
+    const { data: savedBanner, error: upsertError } = await supabase
+      .from("banners")
+      .upsert(
+        {
+          banner_number: bannerNumber,
+          drama_id: dramaId,
+          title,
+          media_type: media.mediaType,
+          telegram_file_id: media.fileId,
+          telegram_file_unique_id: media.uniqueFileId,
+          updated_at: new Date().toISOString(),
+        },
+        {
+          onConflict: "banner_number",
+        },
+      )
+      .select("banner_number, title, media_type, drama_id")
+      .single();
+
+    if (upsertError || !savedBanner) {
+      console.error("Banner upsert failed:", {
+        message: upsertError?.message,
+        code: upsertError?.code,
+        details: upsertError?.details,
+        hint: upsertError?.hint,
+        bannerNumber,
+        mediaType: media.mediaType,
+      });
+
+      // No success message when the database write fails.
+      // HTTP 200 acknowledges this update to Telegram and prevents repeated delivery.
+      return jsonResponse({
+        success: false,
+        error: "Database save failed",
+      });
+    }
+
+    console.log("Banner saved successfully:", {
+      bannerNumber: savedBanner.banner_number,
+      mediaType: savedBanner.media_type,
+      messageId: post.message_id,
+    });
+
+    const successMessage =
+      `✅ Banner ${savedBanner.banner_number} successfully save/update ho gaya!\n` +
+      `Title: ${savedBanner.title}\n` +
+      `Media: ${savedBanner.media_type}`;
+
+    await sendTelegramMessage(
+      botToken,
+      post.chat.id,
+      successMessage,
+      post.message_id,
+    );
+
+    return jsonResponse({
+      success: true,
+      message: "Banner saved successfully",
+      banner: savedBanner,
+    });
+  } catch (error) {
+    console.error("Unexpected banner webhook error:", error);
+
+    // Acknowledge this update so Telegram will not repeatedly retry it.
+    // The error is logged; success is not reported.
+    return jsonResponse({
+      success: false,
+      error: "Unexpected processing error",
+    });
+  }
+});
